@@ -222,7 +222,7 @@ export const configurarEscucha = (sock) => {
                                 formData.append('titulo', `Mascota ${estado.datos.nombre_mascota}`.substring(0, 70));
                                 formData.append('nombre_contacto', estado.datos.nombre_contacto);
                                 formData.append('celular', estado.datos.celular); // Se mantiene el nombre de columna "celular"
-                                formData.append('nota', `Reporte vía WhatsApp de ${estado.datos.nombre_contacto}`);
+                                formData.append('nota', `Tel: ${estado.datos.celular}`);
                                 formData.append('sexo', 'Macho');
                                 formData.append('calle', 'GPS WhatsApp');
                                 formData.append('latitud', String(estado.datos.latitud));
