@@ -1,15 +1,15 @@
 import { delay, downloadMediaMessage } from '@whiskeysockets/baileys';
 import 'dotenv/config';
-
+ 
 // --- CONFIGURACIÓN DE API ---
 const API_BASE_URL = process.env.API_BASE_URL ? process.env.API_BASE_URL.replace(/\/$/, "") : "";
-
+ 
 // Número de WhatsApp del administrador para recibir sugerencias (definido en .env)
 const ADMIN_PHONE = process.env.ADMIN_PHONE ? process.env.ADMIN_PHONE.replace(/\D/g, '') : null;
-
+ 
 let sesiones = {};
 let configDB = { categorias: {}, tipos: {} };
-
+ 
 /**
  * 🧹 GESTIÓN DE EXPIRACIÓN DE SESIÓN (30 MINUTOS)
  */
@@ -24,7 +24,17 @@ const gestionarTimeout = (jid) => {
         }
     }, 30 * 60 * 1000);
 };
-
+ 
+/**
+ * 🧹 Helper para limpiar sesión (evita repetir código)
+ */
+const limpiarSesion = (jid) => {
+    if (sesiones[jid]) {
+        clearTimeout(sesiones[jid].timeout);
+        delete sesiones[jid];
+    }
+};
+ 
 /**
  * 🛰️ SINCRONIZACIÓN INICIAL CON EL PORTAL (MySQL)
  */
@@ -45,28 +55,28 @@ async function cargarMaestros() {
         configDB.tipos = { "PERRO": 10, "GATO": 20, "OTRO": 30 };
     }
 }
-
+ 
 cargarMaestros();
-
+ 
 export const configurarEscucha = (sock) => {
     if (!sock) return;
-
+ 
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             const { messages, type } = chatUpdate;
             if (type !== 'notify') return;
-
+ 
             for (const msg of messages) {
                 if (msg.key.fromMe) continue;
                 const jid = msg.key.remoteJid;
                 if (jid.endsWith('@g.us')) continue; 
-
+ 
                 const nombreUser = msg.pushName || 'Usuario';
                 const texto = (msg.message?.conversation || 
                                msg.message?.extendedTextMessage?.text || 
                                msg.message?.imageMessage?.caption || "").trim();
                 const textoLower = texto.toLowerCase();
-
+ 
                 // --- 1. COMANDOS DE REINICIO O INICIO ---
                 const comandosReset = ['hola', 'menu', 'reiniciar', 'inicio'];
                 if (!sesiones[jid] || comandosReset.includes(textoLower)) {
@@ -77,10 +87,10 @@ export const configurarEscucha = (sock) => {
                     sesiones[jid].timeout = gestionarTimeout(jid);
                     continue; 
                 }
-
+ 
                 sesiones[jid].timeout = gestionarTimeout(jid);
                 const estado = sesiones[jid];
-
+ 
                 // --- 2. FLUJO DEL BOT ---
                 switch (estado.paso) {
                     
@@ -99,11 +109,9 @@ export const configurarEscucha = (sock) => {
                             estado.paso = 'ESPERANDO_TIPO';
                         } else if (texto === "4") {
                             await sock.sendMessage(jid, { text: "🌐 Visitá nuestra web: http://www.mascotaperdida.com.ar" });
-                            clearTimeout(sesiones[jid].timeout);
-                            delete sesiones[jid];
+                            limpiarSesion(jid);
                             break;
                         } else if (texto === "5") {
-                            // Cambio: Ahora primero pedimos el teléfono
                             estado.paso = 'ESPERANDO_TELEFONO_SUGERENCIA';
                             await sock.sendMessage(jid, { text: "📱 Por favor, ingresá tu número de teléfono de contacto:" });
                             break;
@@ -113,8 +121,8 @@ export const configurarEscucha = (sock) => {
                         }
                         await sock.sendMessage(jid, { text: `✅ Mascota *${estado.datos.categoria_nombre}*.\n\n¿Qué animal es?\n1️⃣ Perro\n2️⃣ Gato\n3️⃣ Otro` });
                         break;
-
-                    // --- NUEVO PASO: TELÉFONO PARA SUGERENCIA ---
+ 
+                    // --- FLUJO SUGERENCIAS ---
                     case 'ESPERANDO_TELEFONO_SUGERENCIA':
                         const telSugerencia = texto.replace(/\D/g, '');
                         if (telSugerencia.length >= 8) {
@@ -122,18 +130,18 @@ export const configurarEscucha = (sock) => {
                             estado.paso = 'ESPERANDO_SUGERENCIA';
                             await sock.sendMessage(jid, { text: "✍️ ¡Perfecto! Ahora escribí tu sugerencia para mejorar PetyBot:" });
                         } else {
-                            await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresá un número de teléfono válido." });
+                            await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresá un número de teléfono válido (mínimo 8 dígitos)." });
                         }
                         break;
-
+ 
                     case 'ESPERANDO_SUGERENCIA':
                         if (!texto) {
                             await sock.sendMessage(jid, { text: "⚠️ No recibí ningún texto. Por favor, escribí tu sugerencia." });
                             break;
                         }
-
+ 
                         await sock.sendMessage(jid, { text: "✅ ¡Gracias por tu sugerencia! La hemos recibido y la tendremos en cuenta. 🐾" });
-
+ 
                         if (ADMIN_PHONE) {
                             const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
                             const mensajeAdmin = `💬 *Nueva Sugerencia recibida*\n\n` +
@@ -146,25 +154,38 @@ export const configurarEscucha = (sock) => {
                             } catch (err) {
                                 console.error('❌ Error al reenviar sugerencia:', err);
                             }
+                        } else {
+                            console.warn('⚠️ ADMIN_PHONE no configurado en .env. Sugerencia no reenviada.');
                         }
-                        clearTimeout(sesiones[jid].timeout);
-                        delete sesiones[jid];
+ 
+                        limpiarSesion(jid);
                         break;
-
+ 
+                    // CORRECCIÓN: validación estricta de las 3 opciones
                     case 'ESPERANDO_TIPO':
-                        let tipoSel = (texto === "1") ? "Perro" : (texto === "2") ? "Gato" : "Otro";
-                        estado.datos.id_tipo = configDB.tipos[tipoSel.toUpperCase()] || configDB.tipos["OTRO"];
-                        estado.datos.tipo_nombre = tipoSel;
+                        if (texto === "1") {
+                            estado.datos.id_tipo = configDB.tipos["PERRO"];
+                            estado.datos.tipo_nombre = "Perro";
+                        } else if (texto === "2") {
+                            estado.datos.id_tipo = configDB.tipos["GATO"];
+                            estado.datos.tipo_nombre = "Gato";
+                        } else if (texto === "3") {
+                            estado.datos.id_tipo = configDB.tipos["OTRO"];
+                            estado.datos.tipo_nombre = "Otro";
+                        } else {
+                            await sock.sendMessage(jid, { text: "❌ Opción no válida. Respondé *1* para Perro, *2* para Gato o *3* para Otro." });
+                            break;
+                        }
                         estado.paso = 'ESPERANDO_NOMBRE';
                         await sock.sendMessage(jid, { text: `✅ ¿Cómo se llama? (O escribí "No sé")` });
                         break;
-
+ 
                     case 'ESPERANDO_NOMBRE':
                         estado.datos.nombre_mascota = texto;
                         estado.paso = 'ESPERANDO_UBICACION';
                         await sock.sendMessage(jid, { text: `📍 Ahora enviame la *Ubicación* (Clip 📎 > Ubicación).` });
                         break;
-
+ 
                     case 'ESPERANDO_UBICACION':
                         const loc = msg.message?.locationMessage || msg.message?.liveLocationMessage;
                         if (loc) {
@@ -176,7 +197,7 @@ export const configurarEscucha = (sock) => {
                             await sock.sendMessage(jid, { text: "⚠️ Usá el botón de adjuntar ubicación de WhatsApp." });
                         }
                         break;
-
+ 
                     case 'ESPERANDO_FOTO':
                         if (msg.message?.imageMessage) {
                             estado.datos.mensajeFoto = msg; 
@@ -186,7 +207,7 @@ export const configurarEscucha = (sock) => {
                             await sock.sendMessage(jid, { text: "⚠️ Necesito la foto para el reporte." });
                         }
                         break;
-
+ 
                     case 'ESPERANDO_CELULAR':
                         const cel = texto.replace(/\D/g, '');
                         if (cel.length >= 10) {
@@ -199,7 +220,7 @@ export const configurarEscucha = (sock) => {
                                            `📞 *Contacto:* ${estado.datos.celular}\n` +
                                            `👤 *Informante:* ${estado.datos.nombre_contacto}\n\n` +
                                            `👇 *Revisá la ubicación y la foto arriba.*`;
-
+ 
                             await sock.sendMessage(jid, { image: bufferFoto, caption: resumenTexto });
                             await sock.sendMessage(jid, { location: { degreesLatitude: estado.datos.latitud, degreesLongitude: estado.datos.longitud } });
                             await sock.sendMessage(jid, { text: "¿Confirmás la publicación en el portal? (Responde *SI* o *NO*)" });
@@ -208,7 +229,7 @@ export const configurarEscucha = (sock) => {
                             await sock.sendMessage(jid, { text: "⚠️ El número debe tener al menos 10 dígitos." });
                         }
                         break;
-
+ 
                     case 'CONFIRMACION':
                         if (textoLower === 'si' || textoLower === 'sí') {
                             await sock.sendMessage(jid, { text: "⏳ Guardando datos en el Portal de Ituzaingó..." });
@@ -221,35 +242,36 @@ export const configurarEscucha = (sock) => {
                                 formData.append('id_raza', '1');
                                 formData.append('titulo', `Mascota ${estado.datos.nombre_mascota}`.substring(0, 70));
                                 formData.append('nombre_contacto', estado.datos.nombre_contacto);
-                                formData.append('celular', estado.datos.celular); // Se mantiene el nombre de columna "celular"
+                                formData.append('celular', estado.datos.celular);
                                 formData.append('nota', `Tel: ${estado.datos.celular}`);
                                 formData.append('sexo', 'Macho');
                                 formData.append('calle', 'GPS WhatsApp');
                                 formData.append('latitud', String(estado.datos.latitud));
                                 formData.append('longitud', String(estado.datos.longitud));
-
+ 
                                 const blob = new Blob([buffer], { type: 'image/jpeg' });
                                 formData.append('foto2', blob, 'mascota_reporte.jpg');
-
+ 
                                 const response = await fetch(`${API_BASE_URL}/api/mascota_chat_graba`, {
                                     method: "POST",
                                     body: formData
                                 });
-
+ 
                                 if (response.ok) {
                                     await sock.sendMessage(jid, { text: "🚀 ¡TODO LISTO! Ya podés ver la publicación en la web. ¡Gracias por ayudar! 🐾" });
                                 } else {
-                                    throw new Error('Error en el backend');
+                                    throw new Error(`Error en el backend: ${response.status}`);
                                 }
                             } catch (err) {
-                                await sock.sendMessage(jid, { text: "⚠️ Error al conectar con el servidor. Reintentá." });
+                                // CORRECCIÓN: la sesión siempre se limpia, incluso si falla el POST
+                                console.error('❌ Error al guardar reporte:', err);
+                                await sock.sendMessage(jid, { text: "⚠️ Error al conectar con el servidor. Escribí *HOLA* para intentar de nuevo." });
+                            } finally {
+                                limpiarSesion(jid);
                             }
-                            clearTimeout(sesiones[jid].timeout);
-                            delete sesiones[jid];
                         } else if (textoLower === 'no') {
                             await sock.sendMessage(jid, { text: "❌ Publicación cancelada. Escribí *HOLA* para empezar." });
-                            clearTimeout(sesiones[jid].timeout);
-                            delete sesiones[jid];
+                            limpiarSesion(jid);
                         } else {
                             await sock.sendMessage(jid, { text: "⚠️ Por favor, respondé *SI* o *NO*." });
                         }
@@ -261,3 +283,4 @@ export const configurarEscucha = (sock) => {
         }
     });
 };
+ 
