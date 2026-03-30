@@ -1,15 +1,28 @@
 import { delay, downloadMediaMessage } from '@whiskeysockets/baileys';
 import 'dotenv/config';
- 
+
 // --- CONFIGURACIÓN DE API ---
 const API_BASE_URL = process.env.API_BASE_URL ? process.env.API_BASE_URL.replace(/\/$/, "") : "";
- 
+
 // Número de WhatsApp del administrador para recibir sugerencias (definido en .env)
 const ADMIN_PHONE = process.env.ADMIN_PHONE ? process.env.ADMIN_PHONE.replace(/\D/g, '') : null;
- 
+
 let sesiones = {};
 let configDB = { categorias: {}, tipos: {} };
- 
+
+// Pasos del flujo de reporte donde aplica la cancelación
+const PASOS_CON_CANCELACION = [
+    'ESPERANDO_TIPO',
+    'ESPERANDO_NOMBRE',
+    'ESPERANDO_UBICACION',
+    'ESPERANDO_FOTO',
+    'ESPERANDO_CELULAR',
+    'CONFIRMACION',
+];
+
+// Hint de cancelación que se agrega al pie de cada mensaje del flujo
+const HINT_CANCELAR = `\n\n_Escribí *cancelar* para volver al menú._`;
+
 /**
  * 🧹 GESTIÓN DE EXPIRACIÓN DE SESIÓN (30 MINUTOS)
  */
@@ -24,9 +37,9 @@ const gestionarTimeout = (jid) => {
         }
     }, 30 * 60 * 1000);
 };
- 
+
 /**
- * 🧹 Helper para limpiar sesión (evita repetir código)
+ * 🧹 Helper para limpiar sesión
  */
 const limpiarSesion = (jid) => {
     if (sesiones[jid]) {
@@ -34,7 +47,17 @@ const limpiarSesion = (jid) => {
         delete sesiones[jid];
     }
 };
- 
+
+/**
+ * 🏠 Muestra el menú principal e inicializa la sesión
+ */
+const mostrarMenu = async (sock, jid, nombreUser) => {
+    const menu = `¡Hola ${nombreUser}! Soy PetyBot 🐾\n\n¿En qué puedo ayudarte? Respondé con el número:\n\n1️⃣ *Mascota Perdida* 😢\n2️⃣ *Mascota Encontrada* 🏠\n3️⃣ *Mascota en Adopción* 🐾\n4️⃣ *Ver página Web* 🌐\n5️⃣ *Enviar una Sugerencia* 💬`;
+    await sock.sendMessage(jid, { text: menu });
+    sesiones[jid] = { paso: 'MENU_PRINCIPAL', datos: { nombre_contacto: nombreUser } };
+    sesiones[jid].timeout = gestionarTimeout(jid);
+};
+
 /**
  * 🛰️ SINCRONIZACIÓN INICIAL CON EL PORTAL (MySQL)
  */
@@ -55,43 +78,47 @@ async function cargarMaestros() {
         configDB.tipos = { "PERRO": 10, "GATO": 20, "OTRO": 30 };
     }
 }
- 
+
 cargarMaestros();
- 
+
 export const configurarEscucha = (sock) => {
     if (!sock) return;
- 
+
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             const { messages, type } = chatUpdate;
             if (type !== 'notify') return;
- 
+
             for (const msg of messages) {
                 if (msg.key.fromMe) continue;
                 const jid = msg.key.remoteJid;
                 if (jid.endsWith('@g.us')) continue; 
- 
+
                 const nombreUser = msg.pushName || 'Usuario';
                 const texto = (msg.message?.conversation || 
                                msg.message?.extendedTextMessage?.text || 
                                msg.message?.imageMessage?.caption || "").trim();
                 const textoLower = texto.toLowerCase();
- 
+
                 // --- 1. COMANDOS DE REINICIO O INICIO ---
                 const comandosReset = ['hola', 'menu', 'reiniciar', 'inicio'];
                 if (!sesiones[jid] || comandosReset.includes(textoLower)) {
-                    const menu = `¡Hola ${nombreUser}! Soy PetyBot 🐾\n\n¿En qué puedo ayudarte? Respondé con el número:\n\n1️⃣ *Mascota Perdida* 😢\n2️⃣ *Mascota Encontrada* 🏠\n3️⃣ *Mascota en Adopción* 🐾\n4️⃣ *Ver página Web* 🌐\n5️⃣ *Enviar una Sugerencia* 💬`;
-                    
-                    await sock.sendMessage(jid, { text: menu });
-                    sesiones[jid] = { paso: 'MENU_PRINCIPAL', datos: { nombre_contacto: nombreUser } };
-                    sesiones[jid].timeout = gestionarTimeout(jid);
+                    await mostrarMenu(sock, jid, nombreUser);
                     continue; 
                 }
- 
+
                 sesiones[jid].timeout = gestionarTimeout(jid);
                 const estado = sesiones[jid];
- 
-                // --- 2. FLUJO DEL BOT ---
+
+                // --- 2. CANCELACIÓN GLOBAL (aplica en pasos de reporte) ---
+                if (textoLower === 'cancelar' && PASOS_CON_CANCELACION.includes(estado.paso)) {
+                    limpiarSesion(jid);
+                    await sock.sendMessage(jid, { text: "↩️ Carga cancelada. Volvés al menú principal." });
+                    await mostrarMenu(sock, jid, nombreUser);
+                    continue;
+                }
+
+                // --- 3. FLUJO DEL BOT ---
                 switch (estado.paso) {
                     
                     case 'MENU_PRINCIPAL':
@@ -119,9 +146,9 @@ export const configurarEscucha = (sock) => {
                             await sock.sendMessage(jid, { text: "❌ Opción no válida. Elegí del 1 al 5." });
                             break;
                         }
-                        await sock.sendMessage(jid, { text: `✅ Mascota *${estado.datos.categoria_nombre}*.\n\n¿Qué animal es?\n1️⃣ Perro\n2️⃣ Gato\n3️⃣ Otro` });
+                        await sock.sendMessage(jid, { text: `✅ Mascota *${estado.datos.categoria_nombre}*.\n\n¿Qué animal es?\n1️⃣ Perro\n2️⃣ Gato\n3️⃣ Otro${HINT_CANCELAR}` });
                         break;
- 
+
                     // --- FLUJO SUGERENCIAS ---
                     case 'ESPERANDO_TELEFONO_SUGERENCIA':
                         const telSugerencia = texto.replace(/\D/g, '');
@@ -133,15 +160,15 @@ export const configurarEscucha = (sock) => {
                             await sock.sendMessage(jid, { text: "⚠️ Por favor, ingresá un número de teléfono válido (mínimo 8 dígitos)." });
                         }
                         break;
- 
+
                     case 'ESPERANDO_SUGERENCIA':
                         if (!texto) {
                             await sock.sendMessage(jid, { text: "⚠️ No recibí ningún texto. Por favor, escribí tu sugerencia." });
                             break;
                         }
- 
+
                         await sock.sendMessage(jid, { text: "✅ ¡Gracias por tu sugerencia! La hemos recibido y la tendremos en cuenta. 🐾" });
- 
+
                         if (ADMIN_PHONE) {
                             const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
                             const mensajeAdmin = `💬 *Nueva Sugerencia recibida*\n\n` +
@@ -157,11 +184,10 @@ export const configurarEscucha = (sock) => {
                         } else {
                             console.warn('⚠️ ADMIN_PHONE no configurado en .env. Sugerencia no reenviada.');
                         }
- 
+
                         limpiarSesion(jid);
                         break;
- 
-                    // CORRECCIÓN: validación estricta de las 3 opciones
+
                     case 'ESPERANDO_TIPO':
                         if (texto === "1") {
                             estado.datos.id_tipo = configDB.tipos["PERRO"];
@@ -173,41 +199,41 @@ export const configurarEscucha = (sock) => {
                             estado.datos.id_tipo = configDB.tipos["OTRO"];
                             estado.datos.tipo_nombre = "Otro";
                         } else {
-                            await sock.sendMessage(jid, { text: "❌ Opción no válida. Respondé *1* para Perro, *2* para Gato o *3* para Otro." });
+                            await sock.sendMessage(jid, { text: `❌ Opción no válida. Respondé *1* para Perro, *2* para Gato o *3* para Otro.${HINT_CANCELAR}` });
                             break;
                         }
                         estado.paso = 'ESPERANDO_NOMBRE';
-                        await sock.sendMessage(jid, { text: `✅ ¿Cómo se llama? (O escribí "No sé")` });
+                        await sock.sendMessage(jid, { text: `✅ ¿Cómo se llama la mascota? (O escribí "No sé")${HINT_CANCELAR}` });
                         break;
- 
+
                     case 'ESPERANDO_NOMBRE':
                         estado.datos.nombre_mascota = texto;
                         estado.paso = 'ESPERANDO_UBICACION';
-                        await sock.sendMessage(jid, { text: `📍 Ahora enviame la *Ubicación* (Clip 📎 > Ubicación).` });
+                        await sock.sendMessage(jid, { text: `📍 Enviame la *Ubicación* usando el clip 📎 y eligiendo *Ubicación*.${HINT_CANCELAR}` });
                         break;
- 
+
                     case 'ESPERANDO_UBICACION':
                         const loc = msg.message?.locationMessage || msg.message?.liveLocationMessage;
                         if (loc) {
                             estado.datos.latitud = loc.degreesLatitude;
                             estado.datos.longitud = loc.degreesLongitude;
                             estado.paso = 'ESPERANDO_FOTO';
-                            await sock.sendMessage(jid, { text: "📸 Enviame una *foto* de la mascota." });
+                            await sock.sendMessage(jid, { text: `📸 Enviame una *foto* de la mascota.${HINT_CANCELAR}` });
                         } else {
-                            await sock.sendMessage(jid, { text: "⚠️ Usá el botón de adjuntar ubicación de WhatsApp." });
+                            await sock.sendMessage(jid, { text: `⚠️ Necesito que uses el botón de ubicación de WhatsApp (📎 > Ubicación).${HINT_CANCELAR}` });
                         }
                         break;
- 
+
                     case 'ESPERANDO_FOTO':
                         if (msg.message?.imageMessage) {
                             estado.datos.mensajeFoto = msg; 
                             estado.paso = 'ESPERANDO_CELULAR';
-                            await sock.sendMessage(jid, { text: "📱 Ingresá tu *celular* (Ej: 1112345678)." });
+                            await sock.sendMessage(jid, { text: `📱 Ingresá tu *celular* de contacto (Ej: 1112345678).${HINT_CANCELAR}` });
                         } else {
-                            await sock.sendMessage(jid, { text: "⚠️ Necesito la foto para el reporte." });
+                            await sock.sendMessage(jid, { text: `⚠️ Necesito una foto para el reporte. Enviala desde la galería o la cámara.${HINT_CANCELAR}` });
                         }
                         break;
- 
+
                     case 'ESPERANDO_CELULAR':
                         const cel = texto.replace(/\D/g, '');
                         if (cel.length >= 10) {
@@ -220,16 +246,16 @@ export const configurarEscucha = (sock) => {
                                            `📞 *Contacto:* ${estado.datos.celular}\n` +
                                            `👤 *Informante:* ${estado.datos.nombre_contacto}\n\n` +
                                            `👇 *Revisá la ubicación y la foto arriba.*`;
- 
+
                             await sock.sendMessage(jid, { image: bufferFoto, caption: resumenTexto });
-                            await sock.sendMessage(jid, { location: { degreesLatitude: estado.datos.latitud, degreesLongitude: estado.datos.longitud } });
-                            await sock.sendMessage(jid, { text: "¿Confirmás la publicación en el portal? (Responde *SI* o *NO*)" });
+                            await sock.sendMessage(jid, { location: { degreesLatitude: estado.datos.latitud, degreesLongitud: estado.datos.longitud } });
+                            await sock.sendMessage(jid, { text: `¿Confirmás la publicación en el portal?\n\nRespondé *SI* para publicar o *NO* para cancelar.` });
                             estado.paso = 'CONFIRMACION';
                         } else {
-                            await sock.sendMessage(jid, { text: "⚠️ El número debe tener al menos 10 dígitos." });
+                            await sock.sendMessage(jid, { text: `⚠️ El número debe tener al menos 10 dígitos.${HINT_CANCELAR}` });
                         }
                         break;
- 
+
                     case 'CONFIRMACION':
                         if (textoLower === 'si' || textoLower === 'sí') {
                             await sock.sendMessage(jid, { text: "⏳ Guardando datos en el Portal de Ituzaingó..." });
@@ -248,32 +274,32 @@ export const configurarEscucha = (sock) => {
                                 formData.append('calle', 'GPS WhatsApp');
                                 formData.append('latitud', String(estado.datos.latitud));
                                 formData.append('longitud', String(estado.datos.longitud));
- 
+
                                 const blob = new Blob([buffer], { type: 'image/jpeg' });
                                 formData.append('foto2', blob, 'mascota_reporte.jpg');
- 
+
                                 const response = await fetch(`${API_BASE_URL}/api/mascota_chat_graba`, {
                                     method: "POST",
                                     body: formData
                                 });
- 
+
                                 if (response.ok) {
                                     await sock.sendMessage(jid, { text: "🚀 ¡TODO LISTO! Ya podés ver la publicación en la web. ¡Gracias por ayudar! 🐾" });
                                 } else {
                                     throw new Error(`Error en el backend: ${response.status}`);
                                 }
                             } catch (err) {
-                                // CORRECCIÓN: la sesión siempre se limpia, incluso si falla el POST
                                 console.error('❌ Error al guardar reporte:', err);
                                 await sock.sendMessage(jid, { text: "⚠️ Error al conectar con el servidor. Escribí *HOLA* para intentar de nuevo." });
                             } finally {
                                 limpiarSesion(jid);
                             }
-                        } else if (textoLower === 'no') {
-                            await sock.sendMessage(jid, { text: "❌ Publicación cancelada. Escribí *HOLA* para empezar." });
+                        } else if (textoLower === 'no' || textoLower === 'cancelar') {
                             limpiarSesion(jid);
+                            await sock.sendMessage(jid, { text: "↩️ Publicación cancelada. Volvés al menú principal." });
+                            await mostrarMenu(sock, jid, nombreUser);
                         } else {
-                            await sock.sendMessage(jid, { text: "⚠️ Por favor, respondé *SI* o *NO*." });
+                            await sock.sendMessage(jid, { text: "⚠️ Por favor, respondé *SI* para publicar o *NO* para cancelar." });
                         }
                         break;
                 }
@@ -283,4 +309,3 @@ export const configurarEscucha = (sock) => {
         }
     });
 };
- 
